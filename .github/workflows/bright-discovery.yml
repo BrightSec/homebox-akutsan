@@ -1,154 +1,59 @@
-# .github/workflows/bright-discovery.yml
-#
-# Runs the Bright DISCOVERY agent (bright-discovery) in GitHub Copilot CLI, non-interactively.
-# The agent reads the repo, brings the app up in Docker, starts a Repeater, sets up and verifies
-# authentication, and registers the app's API surface in a Bright project. It does NOT scan and
-# does NOT change the code.
-#
-# Drop-in: put this file into .github/workflows/ of the application repo (e.g. your fork of a
-# training app) and run it from the Actions tab. Or keep it in a separate repo and pass the app
-# as the `target_repo` input.
+# Runs the Bright discovery agent in GitHub Copilot CLI: it brings the app up, sets up auth
+# and registers the app's endpoints in your Bright project. Output is in the run log.
 #
 # Setup (Settings -> Secrets and variables -> Actions):
-#   secret   BRIGHT_TOKEN       Bright API token. Needs the `bot` scope on top of the usual
-#                               scopes: the agent runs a Repeater to reach the app it started.
-#   variable BRIGHT_HOSTNAME    e.g. app.brightsec.com   (NO https:// prefix)
+#   secret   BRIGHT_TOKEN     Bright API token with the `bot` scope (the agent runs a Repeater)
+#   variable BRIGHT_HOSTNAME  e.g. app.brightsec.com (no https://)
 #
-# Copilot authentication needs NO secret: the run uses the built-in GITHUB_TOKEN with the
-# `copilot-requests: write` permission (see `permissions:` below). Usage is billed to the
-# organization that owns the repo, so the org policy "Allow use of Copilot CLI billed to the
-# organization" must be on (default when Copilot CLI is enabled for the org). The repo must
-# belong to an organization with Copilot; a personal-account repo cannot use this mode.
-#
-# Run it: Actions -> "Bright discovery" -> Run workflow -> fill in the Bright project id.
-# Result: the discovered endpoints are in your Bright project; the agent's summary is on the
-# run page (Summary) and in the `bright-discovery-log` artifact.
+# Copilot needs no secret: it uses the built-in GITHUB_TOKEN with `copilot-requests: write`.
+# The repo must belong to an organization with Copilot CLI enabled (usage is billed to the org).
 
 name: Bright discovery
 
 on:
   workflow_dispatch:
     inputs:
-      bright_project:
-        description: "Bright project id (create an empty project in the Bright UI first and copy its id from the URL)."
-        required: true
-      target_repo:
-        description: "Optional: app to discover as owner/name (public repo). Empty = the repo this workflow lives in."
-        required: false
-        default: ""
       extra_instructions:
-        description: "Optional free text for the agent (e.g. 'start the app with docker compose up')."
+        description: "Optional hint for the agent, e.g. how to start the app"
         required: false
         default: ""
 
 permissions:
   contents: read
-  copilot-requests: write      # lets Copilot CLI authenticate with the built-in GITHUB_TOKEN
-
-concurrency:
-  group: bright-discovery-${{ github.ref }}
-  cancel-in-progress: false
-
-defaults:
-  run:
-    shell: bash
+  copilot-requests: write
 
 jobs:
-  bright-discovery:
+  discovery:
     runs-on: ubuntu-latest
     timeout-minutes: 90
-
     env:
       BRIGHT_HOSTNAME: ${{ vars.BRIGHT_HOSTNAME }}
       BRIGHT_TOKEN: ${{ secrets.BRIGHT_TOKEN }}
-      BRIGHT_PROJECT: ${{ inputs.bright_project }}
       EXTRA_INSTRUCTIONS: ${{ inputs.extra_instructions }}
-      COPILOT_CLI_VERSION: "1.0.96"
-      PLUGIN_DIR: ${{ runner.temp }}/bright-ai-plugins
-      # Outside the repo so they stay out of the agent's working tree.
-      RUN_LOG: ${{ runner.temp }}/bright-discovery.log
-      REPORT_FILE: ${{ runner.temp }}/bright-discovery-report.md
+      GITHUB_TOKEN: ${{ github.token }}
 
     steps:
-      # persist-credentials: false keeps the checkout token away from the agent's shell.
-      - name: Checkout app under test
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.target_repo || github.repository }}
           persist-credentials: false
 
-      - name: Set up Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: Install Copilot CLI
-        run: npm install -g "@github/copilot@${COPILOT_CLI_VERSION}"
-
-      # Always the latest main of the plugin repo. The commit is printed for traceability.
-      - name: Clone Bright AI plugins
-        run: |
-          git clone --depth 1 https://github.com/NeuraLegion/bright-ai-plugins "$PLUGIN_DIR"
-          test -f "$PLUGIN_DIR/github-copilot/plugin.json"
-          test -f "$PLUGIN_DIR/github-copilot/agents/bright-discovery.agent.md"
-          echo "Bright plugin at $(git -C "$PLUGIN_DIR" rev-parse HEAD)"
-
       # Copilot CLI does not expand ${VAR} in MCP config, so the shell does it here.
-      - name: Register Bright MCP server
+      - name: Set up Copilot CLI with Bright plugin and MCP server
         run: |
-          HOST="${BRIGHT_HOSTNAME#https://}"; HOST="${HOST#http://}"; HOST="${HOST%/}"
+          npm install -g @github/copilot@1.0.96
+          git clone --depth 1 https://github.com/NeuraLegion/bright-ai-plugins "$RUNNER_TEMP/plugins"
           copilot mcp add --transport http \
             --header "Authorization: Api-Key $BRIGHT_TOKEN" \
-            brightsec "https://$HOST/mcp"
-          copilot mcp list
+            brightsec "https://$BRIGHT_HOSTNAME/mcp"
 
-      - name: Bright discovery agent
-        id: agent
-        timeout-minutes: 75
-        env:
-          # Short-lived, scoped by `permissions:` above (read-only contents).
-          GITHUB_TOKEN: ${{ github.token }}
+      - name: Run discovery agent
         run: |
-          set -o pipefail
-
-          PROMPT="Discover and register this application's endpoints in Bright project '${BRIGHT_PROJECT}'."
-          PROMPT="$PROMPT Do not scan and do not modify the repository."
-          PROMPT="$PROMPT This is a non-interactive CI run: there is no user to ask."
-          PROMPT="$PROMPT If a decision needs input you cannot infer, stop and report it as a blocker."
-          PROMPT="$PROMPT As the final step, write a short markdown report to the absolute path"
-          PROMPT="$PROMPT ${REPORT_FILE} and leave it in place. Include: how many endpoints you"
-          PROMPT="$PROMPT registered (unique method + path), how many of them are write operations,"
-          PROMPT="$PROMPT which authentication mechanisms you set up and verified, what you could"
-          PROMPT="$PROMPT not cover and why, and a link to the project: https://${BRIGHT_HOSTNAME}/projects/${BRIGHT_PROJECT}."
-          PROMPT="$PROMPT Do not paste credentials or full tokens into the report."
-          PROMPT="$PROMPT ${EXTRA_INSTRUCTIONS}"
-
           copilot \
-            --plugin-dir "$PLUGIN_DIR/github-copilot" \
+            --plugin-dir "$RUNNER_TEMP/plugins/github-copilot" \
             --agent bright-security:bright-discovery \
             --allow-all-tools \
-            --log-level info \
-            -p "$PROMPT" \
-            2>&1 | tee "$RUN_LOG"
-
-      # Show the agent's report on the run page.
-      - name: Publish report to run summary
-        if: always()
-        run: |
-          if [ -s "$REPORT_FILE" ]; then
-            cat "$REPORT_FILE" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "::warning::The agent wrote no report at $REPORT_FILE - check the run log."
-          fi
-
-      # Treat as sensitive: the log can contain requests/responses and app credentials.
-      - name: Upload run log and report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bright-discovery-log
-          path: |
-            ${{ runner.temp }}/bright-discovery.log
-            ${{ runner.temp }}/bright-discovery-report.md
-          if-no-files-found: warn
-          retention-days: 7
+            -p "Discover and register this application's endpoints in Bright. This is a non-interactive CI run: there is no user to ask. $EXTRA_INSTRUCTIONS"
